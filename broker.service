@@ -1,0 +1,13 @@
+[Unit]
+Description=Broker
+After=network.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+ExecStart=/root/broker --secure="true" --admin_token="23ce4234@123$" --jwt_secret="xTJEX234$##$" --domain="broker.upbase.dev" --password_checker="true"
+
+[Install]
+WantedBy=multi-user.target
