@@ -1,6 +1,6 @@
 ## Broker - Real-time BaaS (Backend as a Service)
 
-[![crates.io](https://meritbadge.herokuapp.com/broker)](https://crates.io/crates/broker)
+[![crates.io](https://img.shields.io/crates/v/broker)](https://crates.io/crates/broker)
 
 ### Purpose
 
