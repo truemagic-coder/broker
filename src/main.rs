@@ -12,11 +12,9 @@ use http_types::headers::HeaderValue;
 use tide::security::{CorsMiddleware, Origin};
 use tide_acme::{AcmeConfig, TideRustlsExt};
 use mailchecker::is_valid;
-use zxcvbn::zxcvbn;
+use zxcvbn::{zxcvbn, Score};
 use chbs::{config::BasicConfig, prelude::*};
-use totp_rs::{Algorithm, TOTP};
-extern crate biscuit_auth as biscuit;
-use biscuit::{crypto::KeyPair, token::Biscuit};
+use totp_rs::{Algorithm, Secret, TOTP};
 use regex::Regex;
 
 lazy_static! {
@@ -123,7 +121,7 @@ pub struct Claims {
     pub iss: String,         
     pub sub: String,
     pub aud: Vec<String>,
-    pub scopes: String
+    pub scopes: String,
 }
 
 fn replace(key: String, value: Vec<u8>) -> Result<()> {
@@ -154,8 +152,8 @@ fn modify_user(update_user_form: UpdateUserForm) -> Result<Option<String>> {
                     let configure = env_var_config();
 
                     if configure.password_checker {
-                        let estimate = zxcvbn(&password, &[&user.username]).unwrap();
-                        if estimate.score() < 3 {
+                        let estimate = zxcvbn(&password, &[&user.username]);
+                        if estimate.score() < Score::Three {
                             let err: String;
                             match estimate.feedback() {
                                 Some(feedback) => {
@@ -194,17 +192,25 @@ fn modify_user(update_user_form: UpdateUserForm) -> Result<Option<String>> {
 }
 
 fn get_user_by_username(user_username: String) -> Result<Option<User>> {
-    let users = get_users()?;
+    let users = get_users(&DB)?;
     Ok(users.into_iter().filter(|user| user.username == user_username).last())
 }
 
-fn get_users() -> Result<Vec<User>> {
+fn get_users(db: &DB) -> Result<Vec<User>, rocksdb::Error> {
     let prefix = "users".to_string();
-    let i = DB.prefix_iterator(prefix.as_bytes());
-    let res : Vec<User> = i.map(|(_, v)| {
-        let data: User = rmp_serde::from_read_ref(&v).unwrap();
-        data
-    }).collect();
+    let iter = db.prefix_iterator(prefix.as_bytes());
+    let mut res: Vec<User> = Vec::new();
+
+    for item in iter {
+        match item {
+            Ok((_, v)) => {
+                let data: User = rmp_serde::from_slice(&v).unwrap();
+                res.push(data);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     Ok(res)
 }
 
@@ -216,7 +222,7 @@ fn puts_user(user: User) -> Result<()> {
 }
 
 fn is_user_unique(user_username: String) -> Result<bool> {
-    let users = get_users()?;
+    let users = get_users(&DB)?;
     for user in users {
         if user.username == user_username {
             return Ok(false);
@@ -225,27 +231,9 @@ fn is_user_unique(user_username: String) -> Result<bool> {
     Ok(true)
 }
 
-fn jwt_scopes(scopes: Vec<String>) -> Result<Option<String>> {
-    let biscuit_root = KeyPair::new();
-    let biscuit_public_key = biscuit_root.public();
-    let public_key_bytes = biscuit_public_key.to_bytes();
-
-    let mut builder = Biscuit::builder(&biscuit_root);
-
-    for scope in scopes.clone() {
-        let mut parts = scope.split(":");
-        let first = parts.next().unwrap_or_else(|| "INTERNAL_ERROR");
-        let second = parts.next().unwrap_or_else(|| "INTERNAL_ERROR");
-        if first == "INTERNAL_ERROR" || second == "INTERNAL_ERROR" {
-            return Ok(None);
-        }
-        let f = format!("right(#authority, \"{}\", #{})", first, second);
-        let t = f.as_ref();
-        builder.add_authority_fact(t)?;
-    }
-    
-    let biscuit = builder.build()?;
-    Ok(Some(json!({"key": public_key_bytes, "token": biscuit.to_vec()?}).to_string()))
+fn jwt_scopes(scopes: Vec<String>) -> String {
+    let scoped = scopes.join(" ");
+    return scoped;
 }
 
 fn user_create(user_form: UserForm) -> Result<Option<String>> {
@@ -265,8 +253,8 @@ fn user_create(user_form: UserForm) -> Result<Option<String>> {
     } else {
         let configure = env_var_config();
         if configure.password_checker {
-            let estimate = zxcvbn(&user_form.password, &[&user_form.username]).unwrap();
-            if estimate.score() < 3 {
+            let estimate = zxcvbn(&user_form.password, &[&user_form.username]);
+            if estimate.score() < Score::Three {
                 let err: String;
                 match estimate.feedback() {
                     Some(feedback) => {
@@ -351,33 +339,29 @@ async fn create_jwt(login: LoginForm) -> Result<Option<String>> {
                                         6,
                                         1,
                                         30,
-                                        user.clone().totp,
+                                        Secret::Raw(user.clone().totp.as_bytes().to_vec()).to_bytes().unwrap(),
+                                        Some(String::from("")),
+                                        String::from(""),
                                     );
                                     let time = nippy::get_unix_ntp_time().await?;
-                                    if totp.check(&token, time.try_into()?) {
-                                        let app = env_var_config();
-                                        let iat = nippy::get_unix_ntp_time().await?;
-                                        let exp = iat + app.jwt_expiry;
-                                        let iss = "https://broker.upbase.dev/".to_string();
-                                        let aud = ["https://broker.upbase.dev/userinfo".to_string()].to_vec();
-                                        let scoped: String;
-                                        match user.scopes.clone() {
-                                            Some(scopes) => {
-                                                match jwt_scopes(scopes)? {
-                                                    Some(a) => {
-                                                        scoped = a;
-                                                    },
-                                                    None => { scoped = "".to_string() }
-                                                }
-                                            },
-                                            None => { scoped = "".to_string() }
-                                        }
-                                        let my_claims = Claims{sub: user.clone().username, exp, iat, iss, scopes: scoped, aud};
-                                        let pem = async_std::fs::read(&app.jwt_rsa_private).await?;
-                                        let token = encode(&Header::new(RS256), &my_claims, &EncodingKey::from_rsa_pem(&pem)?)?;
-                                        Ok(Some(token))
-                                    } else {
-                                        Ok(None)
+                                    match totp {
+                                        Ok(totp) => {
+                                            if totp.check(&token, time.try_into()?) {
+                                                let app = env_var_config();
+                                                let iat = nippy::get_unix_ntp_time().await?;
+                                                let exp = iat + app.jwt_expiry;
+                                                let iss = "https://broker.upbase.dev/".to_string();
+                                                let aud = ["https://broker.upbase.dev/userinfo".to_string()].to_vec();
+                                                let scopes = jwt_scopes(user.scopes.clone().unwrap());
+                                                let my_claims = Claims{sub: user.clone().username, exp, iat, scopes, iss, aud};
+                                                let pem = async_std::fs::read(&app.jwt_rsa_private).await?;
+                                                let token = encode(&Header::new(RS256), &my_claims, &EncodingKey::from_rsa_pem(&pem)?)?;
+                                                return Ok(Some(token))
+                                            } else {
+                                               return Ok(None)
+                                            }
+                                        },
+                                        Err(_) => { return Ok(None) }
                                     }
                                 },
                                 None => { Ok(None) }
@@ -388,20 +372,8 @@ async fn create_jwt(login: LoginForm) -> Result<Option<String>> {
                             let exp = iat + app.jwt_expiry;
                             let iss = "https://broker.upbase.dev/".to_string();
                             let aud = ["https://broker.upbase.dev/userinfo".to_string()].to_vec();
-                            let scoped: String;
-                            match user.scopes.clone() {
-                                Some(scopes) => {
-                                    match jwt_scopes(scopes)? {
-                                        Some(a) => {
-                                            println!("foo4");
-                                            scoped = a;
-                                        },
-                                        None => { scoped = "".to_string() }
-                                    }
-                                },
-                                None => { scoped = "".to_string() }
-                            }
-                            let my_claims = Claims{sub: user.clone().username, exp, iat, iss, scopes: scoped, aud};
+                            let scopes = jwt_scopes(user.scopes.clone().unwrap());
+                            let my_claims = Claims{sub: user.clone().username, exp, iat, iss, scopes, aud};
                             let pem = async_std::fs::read(&app.jwt_rsa_private).await?;
                             let token = encode(&Header::new(RS256), &my_claims, &EncodingKey::from_rsa_pem(&pem)?)?;
                             Ok(Some(token))                
@@ -413,19 +385,8 @@ async fn create_jwt(login: LoginForm) -> Result<Option<String>> {
                         let exp = iat + app.jwt_expiry;
                         let iss = "https://broker.upbase.dev/".to_string();
                         let aud = ["https://broker.upbase.dev/userinfo".to_string()].to_vec();
-                        let scoped: String;
-                        match user.scopes.clone() {
-                            Some(scopes) => {
-                                match jwt_scopes(scopes).unwrap() {
-                                    Some(a) => {
-                                        scoped = a;
-                                    },
-                                    None => { scoped = "".to_string() }
-                                }
-                            },
-                            None => { scoped = "".to_string() }
-                        }
-                        let my_claims = Claims{sub: user.clone().username, exp, iat, iss, scopes: scoped, aud};
+                        let scopes = jwt_scopes(user.scopes.clone().unwrap());
+                        let my_claims = Claims{sub: user.clone().username, exp, iat, iss, scopes, aud};
                         let pem = async_std::fs::read(&app.jwt_rsa_private).await.unwrap();
                         let token = encode(&Header::new(RS256), &my_claims, &EncodingKey::from_rsa_pem(&pem).unwrap()).unwrap();
                         Ok(Some(token))
@@ -524,10 +485,9 @@ async fn verify_user(token: String) -> Result<Option<User>> {
 }
 
 async fn login_user(mut req: Request<()>) -> tide::Result {
-    let r =  req.body_string().await?;
-    let login_form : LoginForm = serde_json::from_str(&r)?;
-    let token = create_jwt(login_form).await.unwrap();
-    match token {
+    let r = req.body_string().await?;
+    let login_form: LoginForm = serde_json::from_str(&r)?;
+    match create_jwt(login_form).await? {
         Some(jwt) => {
             let msg = json!({"jwt": jwt}).to_string();
             Ok(tide::Response::builder(200).body(msg).header("content-type", "application/json").build())
@@ -538,33 +498,9 @@ async fn login_user(mut req: Request<()>) -> tide::Result {
     }
 }
 
-async fn update_user(mut req: Request<()>) -> tide::Result {
-    match req.header("authorization") {
-        Some(bearer) => {
-            let token = bearer.last().to_string();
-            let check = verify_user(token).await?;
-            match check {
-                Some(_) => {  
-                    let r =  req.body_string().await?;
-                    let update_user_form : UpdateUserForm = serde_json::from_str(&r)?;
-                    match modify_user(update_user_form)? {
-                        Some(err) => {
-                            Ok(tide::Response::builder(400).body(err).header("content-type", "application/json").build())
-                        },
-                        None => {
-                            Ok(tide::Response::builder(200).header("content-type", "application/json").build())
-                        }
-                    }
-                },
-                None => {
-                    Ok(tide::Response::builder(401).header("content-type", "application/json").build())
-                }
-            }
-        },
-        None => {
-            Ok(tide::Response::builder(401).header("content-type", "application/json").build())
-        }
-    }
+
+async fn health(_req: Request<()>) -> tide::Result {
+    Ok(tide::Response::builder(200).body("OK").header("content-type", "text/plain").build())
 }
 
 async fn get_user(req: Request<()>) -> tide::Result {
@@ -573,136 +509,207 @@ async fn get_user(req: Request<()>) -> tide::Result {
             let token = bearer.last().to_string();
             let check = verify_user(token).await?;
             match check {
-                Some(mut user) => {
-                    user.totp = "***".to_string();
-                    user.password = "***".to_string();
+                Some(user) => {
                     let j = json!({"user": user}).to_string();
-                    return Ok(tide::Response::builder(200).body(j).header("content-type", "application/json").build())
-                },
-                None => {
-                    Ok(tide::Response::builder(401).header("content-type", "application/json").build())
-                }
-            }
-        },
-        None => {
-            Ok(tide::Response::builder(401).header("content-type", "application/json").build())
-        }
-    } 
-}
-
-async fn health(_: Request<()>) -> tide::Result {
-    Ok(tide::Response::builder(200).header("content-type", "application/json").build())
-}
-
-async fn create_qr(req: Request<()>) -> tide::Result {
-    match req.header("authorization") {
-        Some(bearer) => {
-            let token = bearer.last().to_string();
-            let check = verify_user(token).await?;
-            match check {
-                Some(user) => {        
-                    let totp = TOTP::new(
-                        Algorithm::SHA512,
-                        6,
-                        1,
-                        30,
-                        user.totp,
-                    );
-                    let code = totp.get_qr(&user.username, "Upbase").unwrap();
-                    let j = json!({"qr": code});
-                
                     Ok(tide::Response::builder(200).body(j).header("content-type", "application/json").build())
                 },
-                None => {      
-                    Ok(tide::Response::builder(401).header("content-type", "application/json").build())
-                }
+                None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
             }
         },
+        None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+    }
+}
+
+async fn update_user(mut req: Request<()>) -> tide::Result {
+    let r = req.body_string().await?;
+    let update_user_form: UpdateUserForm = serde_json::from_str(&r)?;
+    match modify_user(update_user_form)? {
+        Some(err) => {
+            Ok(tide::Response::builder(400).body(err).header("content-type", "application/json").build())
+        },
         None => {
-            Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+            Ok(tide::Response::builder(200).body("").header("content-type", "application/json").build())
         }
     }
 }
 
-async fn create_totp(mut req: Request<()>) -> tide::Result {
-    let r =  req.body_string().await?;
-    let create_totp_form : CreateTOTPForm = serde_json::from_str(&r)?;
-    
-    let configure = env_var_config();
+async fn create_qr(mut req: Request<()>) -> tide::Result {
+    let r = req.body_string().await?;
+    let create_qr_form: CreateQRForm = serde_json::from_str(&r)?;
+    let totp = TOTP::new(
+        Algorithm::SHA512,
+        6,
+        1,
+        30,
+        Secret::Raw(create_qr_form.username.clone().as_bytes().to_vec()).to_bytes().unwrap(),
+        Some(String::from("")),
+        String::from(""),
+    )?;
+    let qr_code = totp.get_url();
+    Ok(tide::Response::builder(200).body(qr_code).header("content-type", "application/json").build())
+}
 
+async fn create_totp(mut req: Request<()>) -> tide::Result {
+    let r = req.body_string().await?;
+    let create_totp_form: CreateTOTPForm = serde_json::from_str(&r)?;
     match get_user_by_username(create_totp_form.username)? {
         Some(user) => {
             let totp = TOTP::new(
                 Algorithm::SHA512,
                 6,
                 1,
-                configure.totp_duration,
-                user.totp,
-            );
-
-            let time = nippy::get_unix_ntp_time().await?;
-            let token = totp.generate(time.try_into()?);
-            let j = json!({"totp": token});
-        
-            Ok(tide::Response::builder(200).body(j).header("content-type", "application/json").build())
+                30,
+                Secret::Raw(user.clone().totp.as_bytes().to_vec()).to_bytes().unwrap(),
+                Some(String::from("")),
+                String::from(""),
+            )?;
+            let qr_code = totp.get_url();
+            Ok(tide::Response::builder(200).body(qr_code).header("content-type", "application/json").build())
         },
-        None => {
-            Ok(tide::Response::builder(401).header("content-type", "application/json").build())
-        }
+        None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
     }
 }
 
 async fn password_reset(mut req: Request<()>) -> tide::Result {
-    let r =  req.body_string().await?;
-    let password_reset_form : PasswordResetForm = serde_json::from_str(&r)?;
-
-    let configure = env_var_config();
-
+    let r = req.body_string().await?;
+    let password_reset_form: PasswordResetForm = serde_json::from_str(&r)?;
     match get_user_by_username(password_reset_form.username)? {
-        Some(user) => {
+        Some(mut user) => {
             let totp = TOTP::new(
                 Algorithm::SHA512,
                 6,
                 1,
-                configure.totp_duration,
-                user.totp,
-            );
-
+                30,
+                Secret::Raw(user.clone().totp.as_bytes().to_vec()).to_bytes().unwrap(),
+                Some(String::from("")),
+                String::from(""),
+            )?;
             let time = nippy::get_unix_ntp_time().await?;
-            let check = totp.check(&password_reset_form.totp, time.try_into()?);
-
-            if check {
-                let update_user_form = UpdateUserForm{
-                    username: user.username,
-                    password: Some(password_reset_form.password),
-                    email: user.email,
-                    data: user.data,
-                    scopes: user.scopes,
-                    two_factor: user.two_factor,
-                };
-                modify_user(update_user_form)?;
+            if totp.check(&password_reset_form.totp, time.try_into()?) {
+                let config = Argon2Config::default();
+                let uuid_string = Uuid::new_v4().to_string();
+                let salt = uuid_string.as_bytes();
+                let password = password_reset_form.password.as_bytes();
+                let hashed = argon2::hash_encoded(password, salt, &config).unwrap();
+                user.password = hashed;
+                puts_user(user)?;
                 Ok(tide::Response::builder(200).header("content-type", "application/json").build())
             } else {
-                Ok(tide::Response::builder(401).header("content-type", "application/json").build())  
+                Ok(tide::Response::builder(401).header("content-type", "application/json").build())
             }
         },
-        None => {
-            Ok(tide::Response::builder(401).header("content-type", "application/json").build())
-        }
+        None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+    }
+}
+
+async fn insert_event(mut req: Request<()>) -> tide::Result {
+    match req.header("authorization") {
+        Some(bearer) => {
+            let token = bearer.last().to_string();
+            let check = verify_user(token).await?;
+            match check {
+                Some(user) => {
+                    let r = req.body_string().await?;
+                    let event: serde_json::Value = serde_json::from_str(&r)?;
+                    let event_key = format!("events_{}", Uuid::new_v4());
+                    let event_data = json!({
+                        "user": user.username,
+                        "tenant": user.tenant_name,
+                        "event": event
+                    });
+                    let event_value = rmp_serde::to_vec_named(&event_data)?;
+                    replace(event_key, event_value)?;
+                    Ok(tide::Response::builder(200).header("content-type", "application/json").build())
+                },
+                None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+            }
+        },
+        None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+    }
+}
+
+async fn sse(req: Request<()>) -> tide::Result {
+    match req.header("authorization") {
+        Some(bearer) => {
+            let token = bearer.last().to_string();
+            let check = verify_user(token).await?;
+            match check {
+                Some(user) => {
+                    let prefix = format!("events_{}", user.tenant_name);
+                    let events: Vec<serde_json::Value> = DB.prefix_iterator(prefix.as_bytes())
+                        .filter_map(|item| match item {
+                            Ok((_, v)) => Some(rmp_serde::from_slice(&v).unwrap()),
+                            Err(_) => None,
+                        })
+                        .collect();
+                    let mut res = tide::Response::new(200);
+                    res.insert_header("content-type", "text/event-stream");
+                    res.insert_header("cache-control", "no-cache");
+                    res.insert_header("connection", "keep-alive");
+                    res.set_body(serde_json::to_string(&events)?);
+                    Ok(res)
+                },
+                None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+            }
+        },
+        None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+    }
+}
+
+async fn revoke_user(mut req: Request<()>) -> tide::Result {
+    let r = req.body_string().await?;
+    let revoke_user_form: RevokeUserForm = serde_json::from_str(&r)?;
+    match get_user_by_username(revoke_user_form.username)? {
+        Some(mut user) => {
+            user.two_factor = Some(false);
+            puts_user(user)?;
+            Ok(tide::Response::builder(200).header("content-type", "application/json").build())
+        },
+        None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+    }
+}
+
+async fn unrevoke_user(mut req: Request<()>) -> tide::Result {
+    let r = req.body_string().await?;
+    let revoke_user_form: RevokeUserForm = serde_json::from_str(&r)?;
+    match get_user_by_username(revoke_user_form.username)? {
+        Some(mut user) => {
+            user.two_factor = Some(true);
+            puts_user(user)?;
+            Ok(tide::Response::builder(200).header("content-type", "application/json").build())
+        },
+        None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+    }
+}
+
+async fn list_users(req: Request<()>) -> tide::Result {
+    match req.header("authorization") {
+        Some(bearer) => {
+            let token = bearer.last().to_string();
+            let check = verify_user(token).await?;
+            match check {
+                Some(_) => {
+                    let users = get_users(&DB)?;
+                    let j = json!({"users": users}).to_string();
+                    Ok(tide::Response::builder(200).body(j).header("content-type", "application/json").build())
+                },
+                None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
+            }
+        },
+        None => Ok(tide::Response::builder(401).header("content-type", "application/json").build())
     }
 }
 
 #[async_std::main]
 async fn main() -> tide::Result<()> {
-
     let configure = env_var_config();
 
     let cors = CorsMiddleware::new()
-    .allow_methods("GET, POST, OPTIONS".parse::<HeaderValue>().unwrap())
-    .allow_headers("authorization".parse::<HeaderValue>().unwrap())
-    .allow_origin(Origin::from(configure.origin))
-    .allow_credentials(false);
-    
+        .allow_methods("GET, POST, OPTIONS".parse::<HeaderValue>().unwrap())
+        .allow_headers("authorization".parse::<HeaderValue>().unwrap())
+        .allow_origin(Origin::from(configure.origin))
+        .allow_credentials(false);
+
     let mut app = tide::new();
     app.with(driftwood::DevLogger);
     app.with(cors);
@@ -710,30 +717,31 @@ async fn main() -> tide::Result<()> {
     app.at("/").head(health);
     app.at("/create_user").post(create_user);
     app.at("/login").post(login_user);
-    app.at("/userinfo").get(get_user); 
-    app.at("update_user").post(update_user);
+    app.at("/userinfo").get(get_user);
+    app.at("/update_user").post(update_user);
     app.at("/create_qr").get(create_qr);
     app.at("/create_totp").post(create_totp);
     app.at("/password_reset").post(password_reset);
+    app.at("/insert").post(insert_event);
+    app.at("/sse").get(sse);
+    app.at("/revoke_user").post(revoke_user);
+    app.at("/unrevoke_user").post(unrevoke_user);
+    app.at("/list_users").post(list_users);
 
     let ip = format!("0.0.0.0:{}", configure.port);
 
     if configure.secure && configure.auto_cert {
         app.listen(
             tide_rustls::TlsListener::build().addrs("0.0.0.0:443").acme(
-                AcmeConfig::new()
-                    .domains(vec![configure.domain])
-                    .cache_dir(configure.certs)
-                    .production(),
-            ),
-        )
-        .await?;
+                AcmeConfig::new(vec![configure.domain]))
+            )
+            .await?;
     } else if configure.secure && !configure.auto_cert {
         app.listen(
             tide_rustls::TlsListener::build()
-            .addrs("0.0.0.0:443")
-            .cert(configure.cert_path)
-            .key(configure.key_path)
+                .addrs("0.0.0.0:443")
+                .cert(configure.cert_path)
+                .key(configure.key_path),
         )
         .await?;
     } else {

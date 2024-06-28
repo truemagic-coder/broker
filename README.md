@@ -28,7 +28,6 @@ Broker is a competitor to [Firebase](https://firebase.google.com/), [Parse Serve
 * Supports SSL - full end-to-end encryption
 * Provides user authentication with JWTs or HTTP Basic
 * Issues JWTs for authentication (username) and authorization (scopes) for external services
-* Uses [biscuit](https://crates.io/crates/biscuit-auth) for user authorization scoping
 * Verify endpoint for external services like [portal](https://crates.io/crates/portal) and [files](https://crates.io/crates/files)
 * Secure password storage with Argon2 encoding
 * Uses Global NTP servers and doesn't rely on your local server time for JWT expiry timing and Two Factor timing
@@ -79,7 +78,6 @@ POST /create_user
 ```
 - `admin_token` is required and can be set in the command args - it is for not allowing everyone to add a user - the default is `letmein`
 - `email`, `scopes`, `two_factor`, and `data` are optional fields
-- `scopes` are [biscuit](https://crates.io/crates/biscuit-auth) authority scopes/facts so the first part before the colon is the resource while the second part after the colon is the operation. Don't add any additional colons in the scopes.
 
 will return `200` or `500` or `400`
 
